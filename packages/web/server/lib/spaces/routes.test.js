@@ -75,6 +75,14 @@ const journeyOf = (overrides = {}) => {
 };
 
 describe('space routes', () => {
+  it('reports unsupported place management without an upstream failure', async () => {
+    const refuse = async () => { throw new SpaceError('place_operation_unsupported', 'This place does not support this operation.'); };
+    const { call } = await serve({ journey: journeyOf({ readDisk: refuse, cleanUpDisk: refuse, pullImage: refuse }) });
+    for (const [method, action] of [['GET', 'disk'], ['POST', 'clean-up'], ['POST', 'image']]) {
+      expect(await call(method, `${SPACES_ROUTE}/places/example/${action}`)).toMatchObject({ status: 501, body: { code: 'place_operation_unsupported' } });
+    }
+  });
+
   it('answers every journey route with 404 and isolated_spaces_off while the feature is off, and the switch still works', async () => {
     const { call, calls } = await serve({ journey: null, switchState: { enabled: false } });
     for (const [method, path] of [['GET', ''], ['POST', ''], ['GET', '/places'], ['POST', `/${ID}/start`], ['POST', `/${ID}/stop`], ['POST', `/${ID}/restart`], ['POST', `/${ID}/restart-opencode`], ['POST', `/${ID}/grants`], ['GET', '/logins'], ['DELETE', `/${ID}`], ['GET', `/${ID}/journal`], ['GET', `/${ID}/apply`], ['POST', `/${ID}/apply`], ['GET', '/idle-stop'], ['PUT', '/idle-stop'], ['POST', `/${ID}/setup`], ['GET', `/${ID}/setup`], ['GET', '/places/docker/disk'], ['POST', '/places/docker/clean-up'], ['POST', '/places/docker/image']]) {

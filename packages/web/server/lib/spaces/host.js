@@ -17,7 +17,6 @@ import { createCodeIn } from './code-in.js';
 import { createCodeOut } from './code-out.js';
 import { createSpaceDispatcher } from './dispatcher.js';
 import { SpaceError } from './errors.js';
-import { createGatekeeperChannel } from './gatekeeper-channel.js';
 import { createHostGit } from './host-git.js';
 import { createSpaceJourney } from './journey.js';
 import { KEEP_INTERVAL_MS, createLoginExchange, createLoginKeeper } from './login-keeper.js';
@@ -162,7 +161,6 @@ export function createSpacesHost({
   registry.seal();
   const manager = createSpaceManager({ registry });
   const serverInside = createSpaceServerChannel({ exec: dockerPlace.exec });
-  const gatekeeper = createGatekeeperChannel({ exec: dockerPlace.exec });
   const git = createHostGit({ runCommand, gitPath, environment: hostEnvironment });
   const codeIn = createCodeIn({ git, place: dockerPlace });
   const codeOut = createCodeOut({ git, place: dockerPlace });
@@ -270,7 +268,7 @@ export function createSpacesHost({
   const journey = createSpaceJourney({
     manager,
     place: dockerPlace,
-    gatekeeper,
+    egress: dockerPlace.egress,
     codeIn,
     codeOut,
     records,

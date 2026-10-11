@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { REQUIRED_PLACE_METHODS, createPlaceRegistry } from './registry.js';
+import { REQUIRED_EGRESS_METHODS, REQUIRED_PLACE_METHODS, createPlaceRegistry } from './registry.js';
 
 const createPlace = (id) => ({
   id,
   ...Object.fromEntries(REQUIRED_PLACE_METHODS.map((method) => [method, async () => null])),
+  egress: Object.fromEntries(REQUIRED_EGRESS_METHODS.map((method) => [method, async () => null])),
 });
 
 describe('createPlaceRegistry', () => {
@@ -39,6 +40,18 @@ describe('createPlaceRegistry', () => {
     const registry = createPlaceRegistry([createPlace('docker')]);
 
     expect(() => registry.register(createPlace('DOCKER'))).toThrow('already registered');
+  });
+
+  it.each(REQUIRED_EGRESS_METHODS)('rejects a place without egress.%s()', (method) => {
+    const place = createPlace('docker');
+    delete place.egress[method];
+    expect(() => createPlaceRegistry([place])).toThrow(`must implement egress.${method}()`);
+  });
+
+  it('rejects a place without an egress service', () => {
+    const place = createPlace('docker');
+    delete place.egress;
+    expect(() => createPlaceRegistry([place])).toThrow('must implement egress.setNetwork()');
   });
 
   it('accepts nothing after it is sealed', () => {

@@ -18,6 +18,8 @@ Each checklist line ends as "passed, with evidence" or "blocked, with the reason
 4. **Escape tests.** One test per promised restriction, run from inside the space as the attacker. The goal is "the agent cannot", never "it works". They run against every place.
 5. **Manual checklist.** Journey steps 0 to 9, clicked through on each platform.
 
+The `isolated spaces` GitHub workflow runs the module's unit and live Docker suites on Ubuntu for pull requests that change the module, its workflow or dependency configuration. It enables `OPENCHAMBER_TEST_DOCKER=1`, requires Engine 28 or newer and runs one test file at a time. It also supports manual dispatch. Packed-image tests remain separately opt-in, and protection-removal sensitivity checks remain manual; this job does not establish either result or desktop platform coverage.
+
 ## Escape tests
 
 From inside a space, each attempt must fail:

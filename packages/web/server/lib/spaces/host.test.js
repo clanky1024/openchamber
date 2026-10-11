@@ -80,6 +80,20 @@ describe('restartOpenCodeInside', () => {
 });
 
 describe('createSpacesHost', () => {
+  it('reads audit events through the place service without issuing an exec command', async () => {
+    const place = createMemoryPlace();
+    const audit = { records: [{ host: 'api.example.com', decision: 'deny:not-on-allowlist' }], dropped: 0, since: '2026-10-10T00:00:00.000Z' };
+    const asked = [];
+    place.egress.readJournal = async (spaceId) => { asked.push(spaceId); return audit; };
+    const host = createSpacesHost({ dataDir: temporary(), place, logger: { warn: () => {} } });
+    hosts.push(host);
+    const { id } = await host.manager.createSpace({ placeId: 'memory', projectDirectory: '/home/me/project', name: 'Egress service' });
+    place.exec = async () => { throw new Error('Unexpected exec while reading audit events'); };
+    expect(await host.journey.readJournal(id)).toEqual(audit);
+    expect(asked).toEqual([id]);
+    await place.remove(id);
+  });
+
   it('starts no process of its own when it is made, and answers through the place it was given', async () => {
     let started = 0;
     const place = createMemoryPlace();
@@ -191,6 +205,12 @@ const startSpaceServer = async ({ sessions, status = {} }) => {
 
 const fakePlace = (spaces) => ({
   id: 'fake',
+  egress: {
+    setNetwork: async () => {},
+    addGrant: async () => {},
+    readPolicy: async () => ({ mode: 'allowlist', domains: [], grants: [] }),
+    readJournal: async () => ({ records: [], dropped: 0, since: '' }),
+  },
   check: async () => ({ available: true }),
   create: async () => {},
   list: async () => Array.from(spaces.entries(), ([id, space]) => ({ id, name: id, project: space.project ?? 'p', created: '', state: space.running ? 'running' : 'exited', orphans: [], damaged: false, missing: [] })),
@@ -206,6 +226,7 @@ const fakePlace = (spaces) => ({
   start: async (spaceId) => { spaces.get(spaceId).running = true; },
   remove: async (spaceId) => { spaces.delete(spaceId); return { removed: [], failed: [] }; },
   verify: async () => [],
+  readDamage: async () => null,
 });
 
 describe('createSpacesHost: sessions and events', () => {
