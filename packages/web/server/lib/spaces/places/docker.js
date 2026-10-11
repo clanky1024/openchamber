@@ -222,6 +222,19 @@ export function createDockerPlace({ runCommand, openCommandStream = openCommandS
     return [...violations, ...(await verifyGatekeeperContainer(spaceId, gatekeeperContainer))];
   };
 
+  /** Distinguish a stopped enforcement container from one a restart cannot restore. */
+  const readDamage = async (space) => {
+    if (!space.damaged) return null;
+    if (!space.missing.includes(spaceResourceName(space.id, ROLE_GATEKEEPER))) return 'repairable';
+    try {
+      const violations = await verify(space.id);
+      return violations.some((violation) => violation.check === 'gatekeeper_missing') ? 'gatekeeper_gone' : 'repairable';
+    } catch (error) {
+      if (error instanceof SpaceError && error.code === 'gatekeeper_missing') return 'gatekeeper_gone';
+      throw error;
+    }
+  };
+
   const requireNoViolations = (violations, what) => {
     if (violations.length > 0) {
       throw new SpaceError(
@@ -421,7 +434,7 @@ export function createDockerPlace({ runCommand, openCommandStream = openCommandS
       // its gatekeeper still runs, which the host stops when it finds one beside a stopped space.
       const stoppedIdle = state === 'exited' && space.entry.State?.ExitCode === SPACE_IDLE_EXIT_CODE;
       const gatekeeperRunning = guard?.entry.State?.Running === true;
-      return { id, name, project, created, state, stoppedIdle, gatekeeperRunning, orphans, damaged: missing.length > 0, missing };
+      return { id, name, project, created, state, stoppedIdle, gatekeeperRunning, needsStop: state === 'exited' && gatekeeperRunning, orphans, damaged: missing.length > 0, missing };
     });
   };
 
@@ -648,5 +661,15 @@ export function createDockerPlace({ runCommand, openCommandStream = openCommandS
     return starting.get(spaceId);
   };
 
-  return { id: DOCKER_PLACE_ID, check, create, list, exec, execArgv, connect, stop, start, remove, verify, readDisk: disk.read, cleanUpDisk: disk.cleanUp, pullImage, imagePulling: () => imagePull !== null };
+  // Bootstrap uses the private channel above while resources are being created. Host operations
+  // use the checked exec path, so a name without this installation's labels grants no authority.
+  const control = createGatekeeperChannel({ exec, wait, now: () => now().getTime() });
+  const egress = {
+    setNetwork: control.setNetwork,
+    addGrant: control.addGrant,
+    readPolicy: control.readPolicy,
+    readJournal: control.readJournal,
+  };
+
+  return { id: DOCKER_PLACE_ID, check, create, list, exec, execArgv, connect, stop, start, remove, verify, readDamage, egress, readDisk: disk.read, cleanUpDisk: disk.cleanUp, pullImage, imagePulling: () => imagePull !== null };
 }

@@ -612,6 +612,21 @@ describe('docker place: create rollback after a timeout', () => {
 });
 
 describe('docker place: list', () => {
+  it('interprets damage without making shared callers recognize resource names', async () => {
+    const resources = spaceResources();
+    resources.find((resource) => resource.name === GATEKEEPER).entry.State.Running = false;
+    const stopped = makePlace(createFakeDocker({ resources: [...resources, toolsResource()] }));
+    expect(await stopped.readDamage((await stopped.list())[0])).toBe('repairable');
+
+    const gone = makePlace(createFakeDocker({ resources: [...resources.filter((resource) => resource.name !== GATEKEEPER), toolsResource()] }));
+    expect(await gone.readDamage((await gone.list())[0])).toBe('gatekeeper_gone');
+
+    const healthy = makePlace(createFakeDocker({ resources: spaceResources() }));
+    expect(await healthy.readDamage((await healthy.list())[0])).toBeNull();
+    const missingVolume = makePlace(createFakeDocker({ resources: spaceResources().filter((resource) => resource.name !== HOME) }));
+    expect(await missingVolume.readDamage((await missingVolume.list())[0])).toBe('repairable');
+  });
+
   it('builds spaces from labels, with state and orphans', async () => {
     const orphanId = 'ffffffffffff';
     const orphanVolume = `openchamber-space-${orphanId}-volume-work`;
@@ -627,9 +642,9 @@ describe('docker place: list', () => {
 
     const spaces = await makePlace(fake).list();
     expect(spaces).toEqual([
-      { id: ID, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'running', stoppedIdle: false, gatekeeperRunning: true, orphans: [], damaged: false, missing: [] },
-      { id: '111111111111', name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'exited', stoppedIdle: false, gatekeeperRunning: false, orphans: [], damaged: false, missing: [] },
-      { id: orphanId, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'missing', stoppedIdle: false, gatekeeperRunning: false, orphans: [{ kind: 'volume', name: orphanVolume }], damaged: false, missing: [] },
+      { id: ID, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'running', stoppedIdle: false, gatekeeperRunning: true, needsStop: false, orphans: [], damaged: false, missing: [] },
+      { id: '111111111111', name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'exited', stoppedIdle: false, gatekeeperRunning: false, needsStop: false, orphans: [], damaged: false, missing: [] },
+      { id: orphanId, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'missing', stoppedIdle: false, gatekeeperRunning: false, needsStop: false, orphans: [{ kind: 'volume', name: orphanVolume }], damaged: false, missing: [] },
     ]);
   });
 
@@ -637,14 +652,14 @@ describe('docker place: list', () => {
     const fake = createFakeDocker({ resources: spaceResources().filter((resource) => resource.name !== HOME && resource.kind !== 'network') });
 
     expect(await makePlace(fake).list()).toEqual([
-      { id: ID, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'running', stoppedIdle: false, gatekeeperRunning: true, orphans: [], damaged: true, missing: [NETWORK, OUTER_NETWORK, HOME] },
+      { id: ID, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'running', stoppedIdle: false, gatekeeperRunning: true, needsStop: false, orphans: [], damaged: true, missing: [NETWORK, OUTER_NETWORK, HOME] },
     ]);
   });
 
   it('flags a running space whose gatekeeper is gone, or does not run, as damaged and not as missing', async () => {
     const withoutGatekeeper = createFakeDocker({ resources: spaceResources().filter((resource) => resource.name !== GATEKEEPER) });
     expect(await makePlace(withoutGatekeeper).list()).toEqual([
-      { id: ID, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'running', stoppedIdle: false, gatekeeperRunning: false, orphans: [], damaged: true, missing: [GATEKEEPER] },
+      { id: ID, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'running', stoppedIdle: false, gatekeeperRunning: false, needsStop: false, orphans: [], damaged: true, missing: [GATEKEEPER] },
     ]);
 
     // The space runs and its way out does not. For the space that is as good as no gatekeeper.
@@ -662,7 +677,7 @@ describe('docker place: list', () => {
     const seeds = spaceResources();
     const space = seeds.find((resource) => resource.kind === 'container' && resource.name === `openchamber-space-${ID}-space`);
     space.entry.State = { Running: false, Status: 'exited', ExitCode: SPACE_IDLE_EXIT_CODE };
-    expect(await makePlace(createFakeDocker({ resources: seeds })).list()).toMatchObject([{ state: 'exited', stoppedIdle: true, gatekeeperRunning: true, damaged: false, missing: [] }]);
+    expect(await makePlace(createFakeDocker({ resources: seeds })).list()).toMatchObject([{ state: 'exited', stoppedIdle: true, gatekeeperRunning: true, needsStop: true, damaged: false, missing: [] }]);
 
     // Stopped by `docker stop`: the server ends on SIGTERM with 143, which is no idle stop.
     space.entry.State = { Running: false, Status: 'exited', ExitCode: 143 };
@@ -800,6 +815,44 @@ describe('docker place: remove', () => {
   it('rejects when docker cannot list', async () => {
     const fake = createFakeDocker({ resources: spaceResources(), failAt: (args) => args[0] === 'volume' && args[1] === 'ls' });
     await expect(makePlace(fake).remove(ID)).rejects.toMatchObject({ code: 'docker_command_failed' });
+  });
+});
+
+describe('docker place: egress', () => {
+  it('owns the control channel and delivers secrets through stdin after checking ownership', async () => {
+    const fake = createFakeDocker({ resources: [toolsResource()] });
+    const place = makePlace(fake);
+    await place.create(SPEC);
+    const secret = 'disposable-egress-contract-key';
+    await place.egress.addGrant(ID, { id: 'anthropic', upstream: 'https://api.anthropic.com/v1', header: 'x-api-key', secret });
+    const call = fake.calls.at(-1);
+    expect(call.args.slice(0, 5)).toEqual(['exec', '--interactive', '--user', '1000:1000', GATEKEEPER]);
+    expect(call.args.join(' ')).not.toContain(secret);
+    expect(call.options.stdin).toContain(secret);
+    expect(fake.calls.at(-2).args).toEqual(['inspect', '--type', 'container', GATEKEEPER]);
+    expect(Object.keys(place.egress).sort()).toEqual(['addGrant', 'readJournal', 'readPolicy', 'setNetwork']);
+  });
+
+  it('refuses control operations for another installation before sending a secret', async () => {
+    const fake = createFakeDocker({ resources: spaceResources({ owner: 'install-b' }) });
+    const sent = [];
+    const egress = placeOn(async (file, args, options) => {
+      if (args[0] === 'exec') {
+        sent.push(options.stdin);
+        return { code: 0, stdout: 'HTTP/1.1 200 OK\r\n\r\n{"ok":true}', stderr: '' };
+      }
+      return fake.runCommand(file, args, options);
+    }).egress;
+    await expect(egress.addGrant(ID, { id: 'anthropic', upstream: 'https://api.anthropic.com/v1', header: 'x-api-key', secret: 'disposable' })).rejects.toMatchObject({ code: 'space_not_ours' });
+    await expect(egress.setNetwork(ID, { mode: 'open' })).rejects.toMatchObject({ code: 'space_not_ours' });
+    await expect(egress.readPolicy(ID)).rejects.toMatchObject({ code: 'space_not_ours' });
+    await expect(egress.readJournal(ID)).rejects.toMatchObject({ code: 'space_not_ours' });
+    expect(sent).toEqual([]);
+  });
+
+  it('reports a missing gatekeeper through the egress service', async () => {
+    const fake = createFakeDocker({ resources: spaceResources().filter((resource) => resource.name !== GATEKEEPER) });
+    await expect(makePlace(fake).egress.readPolicy(ID)).rejects.toMatchObject({ code: 'gatekeeper_missing' });
   });
 });
 
@@ -1398,7 +1451,7 @@ describe('docker place: new tools at the next start', () => {
     expect(fake.token(CONTAINER)).toBe('seeded-token');
     expect(await place.verify(ID)).toEqual([]);
     expect(await place.list()).toEqual([
-      { id: ID, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'running', stoppedIdle: false, gatekeeperRunning: true, orphans: [], damaged: false, missing: [] },
+      { id: ID, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'running', stoppedIdle: false, gatekeeperRunning: true, needsStop: false, orphans: [], damaged: false, missing: [] },
     ]);
     const create = fake.calls.map((call) => call.args).find((args) => args[0] === 'create');
     expect(create[create.indexOf('--memory') + 1]).toBe('4294967296');

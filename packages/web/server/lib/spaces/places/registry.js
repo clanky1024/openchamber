@@ -1,4 +1,5 @@
-export const REQUIRED_PLACE_METHODS = ['check', 'create', 'list', 'exec', 'execArgv', 'connect', 'stop', 'start', 'remove', 'verify'];
+export const REQUIRED_PLACE_METHODS = ['check', 'create', 'list', 'exec', 'execArgv', 'connect', 'stop', 'start', 'remove', 'verify', 'readDamage'];
+export const REQUIRED_EGRESS_METHODS = ['setNetwork', 'addGrant', 'readPolicy', 'readJournal'];
 
 export function createPlaceRegistry(initialPlaces = []) {
   const places = new Map();
@@ -15,6 +16,11 @@ export function createPlaceRegistry(initialPlaces = []) {
     for (const method of REQUIRED_PLACE_METHODS) {
       if (!(place[method] instanceof Function)) {
         throw new Error(`Place '${key}' must implement ${method}()`);
+      }
+    }
+    for (const method of REQUIRED_EGRESS_METHODS) {
+      if (!(place.egress?.[method] instanceof Function)) {
+        throw new Error(`Place '${key}' must implement egress.${method}()`);
       }
     }
     if (places.has(key)) {

@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { createSpaceId, hashProjectDirectory } from '../labels.js';
 import { runCommand } from '../run-command.js';
-import { REQUIRED_PLACE_METHODS } from './registry.js';
+import { REQUIRED_EGRESS_METHODS, REQUIRED_PLACE_METHODS } from './registry.js';
 
 const CREATE_TIMEOUT_MS = 25 * 60_000;
 
@@ -49,6 +49,9 @@ export function runPlaceContractSuite(title, { enabled = true, setup }) {
       for (const method of REQUIRED_PLACE_METHODS) {
         expect(place[method]).toBeInstanceOf(Function);
       }
+      for (const method of REQUIRED_EGRESS_METHODS) {
+        expect(place.egress[method]).toBeInstanceOf(Function);
+      }
     });
 
     it('is available', async () => {
@@ -63,7 +66,11 @@ export function runPlaceContractSuite(title, { enabled = true, setup }) {
     it('lists the space as running, with what it was created with', async () => {
       const { id, name, project, created } = spec;
       // Stage 5d-3 added `stoppedIdle` and `gatekeeperRunning` to this shape; nothing else changed.
-      expect(await listed()).toEqual({ id, name, project, created, state: 'running', stoppedIdle: false, gatekeeperRunning: true, orphans: [], damaged: false, missing: [] });
+      expect(await listed()).toEqual({ id, name, project, created, state: 'running', stoppedIdle: false, gatekeeperRunning: true, needsStop: false, orphans: [], damaged: false, missing: [] });
+    });
+
+    it('reports no damage for a healthy space', async () => {
+      expect(await place.readDamage(await listed())).toBeNull();
     });
 
     it('refuses to create the same space again, and leaves it alone', async () => {
@@ -101,6 +108,28 @@ export function runPlaceContractSuite(title, { enabled = true, setup }) {
       for (const target of ['setup', 'host', '', 'space-old']) {
         await expect(place.exec(spec.id, ['id', '-u'], { target })).rejects.toMatchObject({ code: 'invalid_exec_target' });
       }
+    });
+
+    it('applies network policy through the place-owned egress service', async () => {
+      const network = { mode: 'allowlist', domains: ['api.example.com'] };
+      await place.egress.setNetwork(spec.id, network);
+      expect(await place.egress.readPolicy(spec.id)).toEqual({ ...network, grants: [] });
+    });
+
+    it('reads grant ids without their credentials', async () => {
+      const secret = 'contract-disposable-credential';
+      await place.egress.addGrant(spec.id, { id: 'contract', upstream: 'https://api.example.com', header: 'authorization', secret });
+      const policy = await place.egress.readPolicy(spec.id);
+      expect(policy.grants).toEqual(['contract']);
+      expect(JSON.stringify(policy)).not.toContain(secret);
+    });
+
+    it('reads a bounded audit result', async () => {
+      const journal = await place.egress.readJournal(spec.id);
+      expect(journal.records).toBeInstanceOf(Array);
+      expect(journal.records.length).toBeLessThanOrEqual(1000);
+      expect(journal.dropped).toEqual(expect.any(Number));
+      expect(journal.since).toEqual(expect.any(String));
     });
 
     // Added in stage 3a. Code travels into a space by `git push` over `ext::`, and git starts that
@@ -141,7 +170,7 @@ export function runPlaceContractSuite(title, { enabled = true, setup }) {
     it('stops the space and lists it as exited', async () => {
       await place.stop(spec.id);
       // Since 5d-3: a stop by the host is not an idle stop, and it takes the gatekeeper down too.
-      expect(await listed()).toMatchObject({ state: 'exited', stoppedIdle: false, gatekeeperRunning: false });
+      expect(await listed()).toMatchObject({ state: 'exited', stoppedIdle: false, gatekeeperRunning: false, needsStop: false });
     });
 
     // Added in stage 4a, for the same reason as the argv: a stopped space has no server to reach.
@@ -157,7 +186,7 @@ export function runPlaceContractSuite(title, { enabled = true, setup }) {
 
     it('starts the space again', async () => {
       await place.start(spec.id);
-      expect(await listed()).toMatchObject({ state: 'running' });
+      expect(await listed()).toMatchObject({ state: 'running', gatekeeperRunning: true, needsStop: false });
       expect(await place.verify(spec.id)).toEqual([]);
     });
 

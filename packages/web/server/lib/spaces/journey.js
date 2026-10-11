@@ -2,7 +2,7 @@
 // code, listed with its state, started again with its network said again to a gatekeeper that
 // forgot it, stopped, removed with everything the host kept for it, its journal read, and its
 // work brought out and applied. Everything here is written once on top of the manager, the
-// gatekeeper channel, code in and code out; the routes in `routes.js` only translate HTTP.
+// place-owned egress service, code in and code out; the routes in `routes.js` only translate HTTP.
 //
 // A creation runs in the background: the request comes back at once with the space's id, and the
 // steps are announced as `openchamber:space-progress` events on the host's hub, so the group in
@@ -41,7 +41,7 @@ import { z } from 'zod';
 
 import { SpaceError } from './errors.js';
 import { DEFAULT_IDLE_STOP, idleStopSchema } from './idle-stop.js';
-import { ROLE_GATEKEEPER, createSpaceId, hashProjectDirectory, spaceResourceName } from './labels.js';
+import { createSpaceId, hashProjectDirectory } from './labels.js';
 import { spaceProjectPath, spaceWindowUrl } from './layout.js';
 import { LOGIN_PROVIDERS, loginEndOf, loginEnded, loginGrantOf } from './space-opencode.js';
 import { domainSchema, grantSchema, networkSchema, providerIdSchema, secretSourceSchema } from './space-records.js';
@@ -140,7 +140,7 @@ const failureOf = (error) => ({
 export function createSpaceJourney({
   manager,
   place,
-  gatekeeper,
+  egress,
   codeIn,
   codeOut,
   records,
@@ -296,7 +296,7 @@ export function createSpaceJourney({
       created = true;
       records.write(entry.id, { network, repository: projectDirectory });
       progress(entry, 'setting_network');
-      await gatekeeper.setNetwork(entry.id, network);
+      await egress.setNetwork(entry.id, network);
       progress(entry, 'bringing_code');
       const arrived = await codeIn.bringCodeIn({ repository: projectDirectory, spaceId: entry.id, mode: start });
       records.update(entry.id, { spacePath: arrived.spacePath, base: arrived.base });
@@ -377,7 +377,7 @@ export function createSpaceJourney({
       ({ upstream, header, secret } = window);
     }
     try {
-      await gatekeeper.addGrant(spaceId, { id: grant.id, upstream, header, secret });
+      await egress.addGrant(spaceId, { id: grant.id, upstream, header, secret });
       return true;
     } catch (error) {
       logger.warn?.(`[spaces] the grant ${grant.id} of space ${spaceId} could not be said again: ${error?.code ?? error?.message ?? error}`);
@@ -524,7 +524,7 @@ export function createSpaceJourney({
       if (grants.length === 0) continue;
       let held;
       try {
-        held = new Set((await gatekeeper.readPolicy(space.id)).grants);
+        held = new Set((await egress.readPolicy(space.id)).grants);
       } catch (error) {
         logger.warn?.(`[spaces] the gatekeeper of space ${space.id} did not say what it holds: ${error?.code ?? error?.message ?? error}`);
         continue;
@@ -551,7 +551,7 @@ export function createSpaceJourney({
     // "needs access" for a moment; while an action holds the space the answer is not given.
     if (space.state !== 'running' || grants.length === 0 || busy.has(space.id)) return { access: null, needsAccess: [] };
     try {
-      const held = new Set((await gatekeeper.readPolicy(space.id)).grants);
+      const held = new Set((await egress.readPolicy(space.id)).grants);
       const needsAccess = grants.filter((grant) => !held.has(grant.id)).map((grant) => grant.id);
       return { access: needsAccess.length === 0 ? 'granted' : 'needs_access', needsAccess };
     } catch (error) {
@@ -560,23 +560,12 @@ export function createSpaceJourney({
     }
   };
 
-  /**
-   * What is broken in a damaged space, for the group's status line: `gatekeeper_gone` when its
-   * gatekeeper container no longer exists, which no start makes again (STAGES.md, "Things stage 2
-   * leaves"), and `repairable` for the rest, a gatekeeper that stopped while the space runs among
-   * them, which the next start brings back. The place's list names the gatekeeper as missing in
-   * both cases; its verification tells them apart, and is asked only for a space that is damaged
-   * that way. A verification that cannot answer leaves it `repairable`, so the user is offered
-   * the restart rather than told the space is lost on a guess.
-   */
+  /** The place interprets its resources; failed inspection keeps the existing restart option. */
   const readDamage = async (space) => {
     if (!space.damaged) return null;
-    if (!space.missing.includes(spaceResourceName(space.id, ROLE_GATEKEEPER))) return 'repairable';
     try {
-      const violations = await place.verify(space.id);
-      return violations.some((violation) => violation.check === 'gatekeeper_missing') ? 'gatekeeper_gone' : 'repairable';
+      return await place.readDamage(space);
     } catch (error) {
-      if (error instanceof SpaceError && error.code === 'gatekeeper_missing') return 'gatekeeper_gone';
       logger.warn?.(`[spaces] space ${space.id} could not be verified: ${error?.code ?? error?.message ?? error}`);
       return 'repairable';
     }
@@ -654,7 +643,7 @@ export function createSpaceJourney({
       };
     }));
     for (const space of spaces) {
-      if (space.state === 'exited' && space.gatekeeperRunning === true && !pending.has(space.id)) stopStrayGatekeeper(space.id);
+      if (space.state === 'exited' && space.needsStop === true && !pending.has(space.id)) stopRemainingResources(space.id);
     }
     // A creation under way wins over the place's view of it: the containers run before the code is there.
     const waiting = new Map(Array.from(pending.values(), (entry) => [entry.id, describePending(entry)]));
@@ -664,18 +653,14 @@ export function createSpaceJourney({
   };
 
   /**
-   * Stops the gatekeeper found running beside a stopped space: a space that stopped itself for the
-   * idle stop leaves it running, because it cannot reach it (the maintainer's call of 2026-09-28).
-   * It serves nobody then, and a key typed into it goes with it, as with a stop by hand. The place's
-   * stop of a stopped space stops only what still runs. A space that another action holds is left
-   * for the next look, since a start is what brings a gatekeeper up before its space; a start that
-   * comes while this runs waits for it, rather than being refused as busy.
+   * Finishes a provider's stop after the workload exits on its own. An action holding the
+   * space defers cleanup to the next listing; a subsequent start waits for cleanup to finish.
    */
-  const stopStrayGatekeeper = (spaceId) => {
+  const stopRemainingResources = (spaceId) => {
     if (busy.has(spaceId) || strayStops.has(spaceId)) return;
     const stopping = manager.stopSpace({ placeId: place.id, spaceId })
       .catch((error) => {
-        logger.warn?.(`[spaces] the gatekeeper beside stopped space ${spaceId} still runs: ${error?.code ?? error?.message ?? error}`);
+        logger.warn?.(`[spaces] resources beside stopped space ${spaceId} still run: ${error?.code ?? error?.message ?? error}`);
       })
       .finally(() => { strayStops.delete(spaceId); });
     strayStops.set(spaceId, stopping);
@@ -702,7 +687,7 @@ export function createSpaceJourney({
     let networkRestored = false;
     let grants = { restored: [], needsAccess: [] };
     if (record) {
-      await gatekeeper.setNetwork(spaceId, record.network);
+      await egress.setNetwork(spaceId, record.network);
       networkRestored = true;
       grants = await restoreGrants(spaceId, record.grants);
       await rewriteProviderConfig(spaceId, record.grants);
@@ -810,7 +795,7 @@ export function createSpaceJourney({
     // removal that fails answers the grant before anything changed.
     const replaced = current.record.grants.find((entry) => entry.id === grant.id);
     if (grant.kind === 'model' && replaced?.kind === 'login') await spaceOpenCode.removeLogin(spaceId, grant.provider);
-    await gatekeeper.addGrant(spaceId, { id: grant.id, ...window });
+    await egress.addGrant(spaceId, { id: grant.id, ...window });
     const grants = [...current.record.grants.filter((entry) => entry.id !== grant.id), grant];
     if (records.update(spaceId, { grants }).status !== 'ok') {
       throw new SpaceError('space_record_unreadable', 'The grant reached the network filter and could not be remembered, so it is gone at the next start. Remove the space and create it again.');
@@ -843,7 +828,7 @@ export function createSpaceJourney({
     if (network.domains.includes(domain)) return { network };
     const next = networkSchema.safeParse({ mode: network.mode, domains: [...network.domains, domain] });
     if (!next.success) throw new SpaceError('too_many_domains', 'This space already has as many opened domains as a list holds.');
-    await gatekeeper.setNetwork(spaceId, next.data);
+    await egress.setNetwork(spaceId, next.data);
     if (records.update(spaceId, { network: next.data }).status !== 'ok') {
       throw new SpaceError('space_record_unreadable', 'The domain is open now and could not be remembered, so it closes at the next start. Remove the space and create it again.');
     }
@@ -962,8 +947,8 @@ export function createSpaceJourney({
     const stillRunning = [];
     for (const space of spaces) {
       if (space.state !== 'running') {
-        // A gatekeeper left by an idle stop goes too, and the space is not counted: it was stopped.
-        if (space.gatekeeperRunning === true && !busy.has(space.id)) await manager.stopSpace({ placeId: place.id, spaceId: space.id }).catch(() => {});
+        // Finish any remaining cleanup without counting the already stopped workload.
+        if (space.needsStop === true && !busy.has(space.id)) await manager.stopSpace({ placeId: place.id, spaceId: space.id }).catch(() => {});
         continue;
       }
       try {
@@ -1004,9 +989,16 @@ export function createSpaceJourney({
     if (placeId !== place.id) throw new SpaceError('place_not_found', `There is no place ${placeId}`);
   };
 
+  const requirePlaceOperations = (...operations) => {
+    if (operations.some((operation) => !(place[operation] instanceof Function))) {
+      throw new SpaceError('place_operation_unsupported', 'This place does not support this operation.');
+    }
+  };
+
   /** The disk the spaces take on a place, and what a clean-up would free now (journey step 9). */
   const readDisk = async (placeId) => {
     requirePlace(placeId);
+    requirePlaceOperations('readDisk');
     return place.readDisk();
   };
 
@@ -1017,6 +1009,7 @@ export function createSpaceJourney({
    */
   const cleanUpDisk = async (placeId) => {
     requirePlace(placeId);
+    requirePlaceOperations('readDisk', 'cleanUpDisk', 'imagePulling');
     if (Array.from(pending.values()).some((entry) => entry.state === 'preparing')) {
       throw new SpaceError('space_preparing', 'A space is being made. Clean up when it is ready.');
     }
@@ -1040,6 +1033,7 @@ export function createSpaceJourney({
    */
   const pullImage = async (placeId) => {
     requirePlace(placeId);
+    requirePlaceOperations('readDisk', 'pullImage');
     place.pullImage().catch((error) => { logger.warn?.(`[spaces] the image download failed: ${error.code ?? error.message}`); });
     return place.readDisk();
   };
@@ -1053,7 +1047,7 @@ export function createSpaceJourney({
     if (space.state !== 'running') {
       throw new SpaceError('space_not_running', 'The journal lives in the memory of the space\'s gatekeeper and is gone with a stop. Start the space to record new attempts.');
     }
-    return gatekeeper.readJournal(spaceId);
+    return egress.readJournal(spaceId);
   });
 
   const requireRepository = async (spaceId) => {

@@ -27,6 +27,8 @@ export function createMemoryPlace({ id = 'memory' } = {}) {
   const spaces = new Map();
   // Every container of every space that was ever made here, by `<space id>:<role>`.
   const containers = new Map();
+  const policies = new Map();
+  const emptyPolicy = () => ({ mode: 'allowlist', domains: [], grants: [], since: new Date().toISOString() });
 
   const requireSpace = (spaceId) => {
     const space = spaces.get(requireSpaceId(spaceId));
@@ -47,8 +49,29 @@ export function createMemoryPlace({ id = 'memory' } = {}) {
     return container;
   };
 
+  const requirePolicy = (spaceId) => {
+    if (requireSpace(spaceId).state !== 'running') {
+      throw new SpaceError('egress_unavailable', `Space ${spaceId} is stopped`);
+    }
+    return policies.get(spaceId);
+  };
+
   return {
     id,
+    egress: {
+      setNetwork: async (spaceId, { mode, domains = [] }) => {
+        Object.assign(requirePolicy(spaceId), { mode, domains: [...domains] });
+      },
+      addGrant: async (spaceId, { id: grantId }) => {
+        const policy = requirePolicy(spaceId);
+        if (!policy.grants.includes(grantId)) policy.grants.push(grantId);
+      },
+      readPolicy: async (spaceId) => {
+        const { mode, domains, grants } = requirePolicy(spaceId);
+        return { mode, domains: [...domains], grants: [...grants] };
+      },
+      readJournal: async (spaceId) => ({ records: [], dropped: 0, since: requirePolicy(spaceId).since }),
+    },
     check: async () => ({ available: true, version: 'memory', os: 'none', arch: 'none', hostIsolation: true }),
     // Memory has no image to download: a pull ends at once and none is ever under way.
     pullImage: async () => {},
@@ -57,7 +80,8 @@ export function createMemoryPlace({ id = 'memory' } = {}) {
       if (spaces.has(requireSpaceId(spaceId))) {
         throw new SpaceError('space_name_taken', `Space ${spaceId} already exists`);
       }
-      spaces.set(spaceId, { id: spaceId, name, project, created, state: 'running', stoppedIdle: false, gatekeeperRunning: true, orphans: [], damaged: false, missing: [] });
+      spaces.set(spaceId, { id: spaceId, name, project, created, state: 'running', stoppedIdle: false, gatekeeperRunning: true, needsStop: false, orphans: [], damaged: false, missing: [] });
+      policies.set(spaceId, emptyPolicy());
       for (const target of TARGETS) {
         // A container has a hostname of its own, as a real one does, so a caller can tell them apart.
         containers.set(`${spaceId}:${target}`, { hostname: crypto.randomBytes(6).toString('hex') });
@@ -106,8 +130,15 @@ export function createMemoryPlace({ id = 'memory' } = {}) {
       }
       return net.connect({ host: '127.0.0.1', port: server.address().port });
     },
-    stop: async (spaceId) => { Object.assign(requireSpace(spaceId), { state: 'exited', gatekeeperRunning: false }); },
-    start: async (spaceId) => { Object.assign(requireSpace(spaceId), { state: 'running', stoppedIdle: false, gatekeeperRunning: true }); },
+    stop: async (spaceId) => {
+      Object.assign(requireSpace(spaceId), { state: 'exited', gatekeeperRunning: false });
+      policies.delete(spaceId);
+    },
+    start: async (spaceId) => {
+      const space = requireSpace(spaceId);
+      if (space.state !== 'running') policies.set(spaceId, emptyPolicy());
+      Object.assign(space, { state: 'running', stoppedIdle: false, gatekeeperRunning: true });
+    },
     remove: async (spaceId) => {
       const removed = [];
       for (const target of TARGETS) {
@@ -118,8 +149,10 @@ export function createMemoryPlace({ id = 'memory' } = {}) {
         removed.push({ kind: 'container', name: `${spaceId}-${target}` });
       }
       if (spaces.delete(spaceId)) removed.push({ kind: 'space', name: spaceId });
+      policies.delete(spaceId);
       return { removed, failed: [] };
     },
+    readDamage: async (space) => space.damaged ? 'repairable' : null,
     verify: async (spaceId) => {
       requireSpace(spaceId);
       requireContainer(spaceId, ROLE_GATEKEEPER);

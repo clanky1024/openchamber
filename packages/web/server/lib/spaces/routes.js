@@ -23,6 +23,7 @@ export const SPACES_ROUTE = '/api/openchamber/spaces';
 const STATUS_BY_CODE = new Map([
   ['space_not_found', 404],
   ['place_not_found', 404],
+  ['place_operation_unsupported', 501],
   ['project_not_registered', 400],
   ['invalid_space_name', 400],
   ['invalid_project_directory', 400],

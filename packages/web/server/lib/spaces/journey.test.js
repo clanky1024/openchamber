@@ -11,7 +11,6 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { SpaceError } from './errors.js';
 import { createSpaceJourney } from './journey.js';
 import { createLoginKeeper } from './login-keeper.js';
-import { ROLE_GATEKEEPER, spaceResourceName } from './labels.js';
 import { IMAGE_TIMEOUT } from './layout.js';
 import { createSpaceManager } from './manager.js';
 import { createMemoryPlace } from './places/memory-place.js';
@@ -105,7 +104,7 @@ const journeyWith = ({ readHostLogin = null, failAt = null, place = createMemory
   const records = createSpaceRecords({ dataDir, logger: quiet });
   const manager = createSpaceManager({ registry: createPlaceRegistry([place]), now: () => new Date('2026-09-26T10:00:00.000Z') });
   const journey = createSpaceJourney({
-    manager, place, gatekeeper, codeIn, codeOut, records, spaceOpenCode, serverInside, restartOpenCodeInside,
+    manager, place, egress: gatekeeper, codeIn, codeOut, records, spaceOpenCode, serverInside, restartOpenCodeInside,
     listProjectDirectories: async () => projects,
     archiveChats,
     readHostSecret: (name) => hostEnvironment[name],
@@ -210,6 +209,25 @@ describe('the journey: create', () => {
 });
 
 describe('the journey: disk and clean-up', () => {
+  it.each([
+    ['readDisk', 'readDisk'],
+    ['cleanUpDisk', 'cleanUpDisk'],
+    ['cleanUpDisk', 'readDisk'],
+    ['cleanUpDisk', 'imagePulling'],
+    ['pullImage', 'pullImage'],
+    ['pullImage', 'readDisk'],
+  ])('refuses %s without %s before any side effects', async (operation, missing) => {
+    const place = createMemoryPlace();
+    const effects = [];
+    place.readDisk = async () => ({});
+    place.cleanUpDisk = async () => { effects.push('cleanUpDisk'); };
+    place.pullImage = async () => { effects.push('pullImage'); };
+    delete place[missing];
+    const { journey } = journeyWith({ place });
+    await expect(journey[operation]('memory')).rejects.toMatchObject({ code: 'place_operation_unsupported' });
+    expect(effects).toEqual([]);
+  });
+
   const DISK = { imageBytes: 1_632_000_000, toolsBytes: 438_000_000, spacesBytes: 0, freeBytes: 1_632_000_000, freesImage: true };
   const placeWithDisk = (cleaned, pull = { pulling: false, pulls: 0, fail: null }) => ({
     ...createMemoryPlace(),
@@ -436,10 +454,10 @@ describe('the journey: repair', () => {
   /** Damages the one space of a memory place after it was made: its gatekeeper missing, and gone for good or only stopped. */
   const damage = (place, gatekeeper) => {
     const list = place.list;
-    place.list = async () => (await list()).map((space) => ({ ...space, damaged: true, missing: [spaceResourceName(space.id, ROLE_GATEKEEPER)] }));
-    place.verify = async () => {
-      if (gatekeeper === 'unverifiable') throw new SpaceError('command_failed', 'docker did not answer');
-      return gatekeeper === 'gone' ? [{ check: 'gatekeeper_missing', message: 'The space has no gatekeeper container' }] : [];
+    place.list = async () => (await list()).map((space) => ({ ...space, damaged: true, missing: ['enforcement'] }));
+    place.readDamage = async () => {
+      if (gatekeeper === 'unverifiable') throw new SpaceError('command_failed', 'runtime did not answer');
+      return gatekeeper === 'gone' ? 'gatekeeper_gone' : 'repairable';
     };
   };
 
@@ -1153,7 +1171,7 @@ describe('the journey: the project folder of a space', () => {
     const asked = [];
     // The record names the folder: a journey that no longer has the project still lists it.
     const unregistered = createSpaceJourney({
-      manager: first.manager, place: first.place, gatekeeper: first.gatekeeper, codeIn: {}, codeOut: {}, records: first.records,
+      manager: first.manager, place: first.place, egress: first.gatekeeper, codeIn: {}, codeOut: {}, records: first.records,
       spaceOpenCode: {}, serverInside: {}, restartOpenCodeInside: async () => {},
       listProjectDirectories: async () => [],
       folderExists: async (directory) => { asked.push(directory); return false; },
@@ -1170,7 +1188,7 @@ describe('the journey: the project folder of a space', () => {
     fs.writeFileSync(file, '');
     const { first } = await made();
     const look = (directory) => createSpaceJourney({
-      manager: first.manager, place: first.place, gatekeeper: first.gatekeeper, codeIn: {}, codeOut: {}, records: { read: () => ({ record: { repository: directory } }) },
+      manager: first.manager, place: first.place, egress: first.gatekeeper, codeIn: {}, codeOut: {}, records: { read: () => ({ record: { repository: directory } }) },
       spaceOpenCode: {}, serverInside: {}, restartOpenCodeInside: async () => {},
       listProjectDirectories: async () => [],
       logger: quiet,
@@ -1199,11 +1217,11 @@ describe('the journey: idle stop', () => {
   };
 
   /** The place's own stops, recorded, and its list as an idle stop leaves it: the space exited, its gatekeeper running. */
-  const idleStopped = (place, { gatekeeperRunning = true } = {}) => {
+  const idleStopped = (place, { needsStop = true } = {}) => {
     const stops = [];
     const { list, stop } = place;
-    let stray = gatekeeperRunning;
-    place.list = async () => (await list()).map((space) => ({ ...space, state: 'exited', stoppedIdle: true, gatekeeperRunning: stray }));
+    let stray = needsStop;
+    place.list = async () => (await list()).map((space) => ({ ...space, state: 'exited', stoppedIdle: true, needsStop: stray }));
     place.stop = async (spaceId) => { stops.push(spaceId); stray = false; return stop(spaceId); };
     return stops;
   };
@@ -1274,7 +1292,7 @@ describe('the journey: idle stop', () => {
 
   it('leaves a stopped space alone when its gatekeeper is down already, or while another action holds it', async () => {
     const quietSpace = await ready();
-    const quietStops = idleStopped(quietSpace.place, { gatekeeperRunning: false });
+    const quietStops = idleStopped(quietSpace.place, { needsStop: false });
     await quietSpace.journey.listSpaces();
     await sleep(20);
     expect(quietStops).toEqual([]);
